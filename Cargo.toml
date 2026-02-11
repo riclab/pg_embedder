@@ -1,0 +1,51 @@
+[package]
+name = "pg_embedder"
+version = "0.2.0"
+edition = "2021"
+description = "Neural embedding engine for PostgreSQL - Hybrid approach with pgvector"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pg_embedder"
+path = "./src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg17"]
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.16.1"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+once_cell = "1.19"
+
+# Candle ML framework
+candle-core = { version = "0.8.2", default-features = false }
+candle-nn = { version = "0.8.2", default-features = false }
+candle-transformers = { version = "0.8.2", default-features = false }
+tokenizers = { version = "0.19.1", default-features = false, features = [
+    "onig",
+] }
+
+[dev-dependencies]
+pgrx-tests = "=0.16.1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
