@@ -4,35 +4,79 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
 use tokenizers::Tokenizer;
 
-#[cfg(all(feature = "model-en", feature = "model-es"))]
+#[cfg(any(
+    all(feature = "model-en", feature = "model-es"),
+    all(feature = "model-en", feature = "model-en-arctic"),
+    all(feature = "model-es", feature = "model-en-arctic"),
+))]
 compile_error!(
-    "enable exactly one embedding model: `model-en` (default) or `model-es`. \
-     To select Spanish, build with --no-default-features --features pgNN,model-es"
+    "enable exactly one embedding model: `model-en` (default), `model-es`, or \
+     `model-en-arctic`. The non-default ones need --no-default-features, e.g. \
+     --no-default-features --features pgNN,model-en-arctic"
 );
+
+/// How token embeddings are reduced to a single vector.
+///
+/// This is a property of how the model was trained, not a tuning knob. Using the
+/// wrong one yields embeddings that look fine — right shape, unit norm — and rank
+/// badly, with nothing raised anywhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pooling {
+    Mean,
+    Cls,
+}
 
 // Embedded weights in binary. English (the official mixedbread-ai/mxbai-embed-xsmall-v1
 // release) is the default and the fallback when no model feature is selected, so
 // --no-default-features builds still link a model.
-#[cfg(not(feature = "model-es"))]
+#[cfg(not(any(feature = "model-es", feature = "model-en-arctic")))]
 mod weights {
+    use super::Pooling;
     pub const MODEL_WEIGHTS: &[u8] = include_bytes!("../../weights/en/model.safetensors");
     pub const TOKENIZER_JSON: &[u8] = include_bytes!("../../weights/en/tokenizer.json");
     pub const CONFIG_JSON: &[u8] = include_bytes!("../../weights/en/config.json");
     pub const MODEL_NAME: &str = "mxbai-embed-xsmall-v1 (en)";
+    pub const POOLING: Pooling = Pooling::Mean;
+    pub const QUERY_PREFIX: Option<&str> = None;
 }
 
 #[cfg(feature = "model-es")]
 mod weights {
+    use super::Pooling;
     pub const MODEL_WEIGHTS: &[u8] = include_bytes!("../../weights/es/model.safetensors");
     pub const TOKENIZER_JSON: &[u8] = include_bytes!("../../weights/es/tokenizer.json");
     pub const CONFIG_JSON: &[u8] = include_bytes!("../../weights/es/config.json");
     pub const MODEL_NAME: &str = "mxbai-embed-xsmall-v1-es (es)";
+    pub const POOLING: Pooling = Pooling::Mean;
+    pub const QUERY_PREFIX: Option<&str> = None;
+}
+
+// Spike: same parameter count and dimension as the default, ~4 MB smaller once cast
+// to F16, and trained for retrieval. Asymmetric — queries carry a prefix that
+// documents must not have. See weights/SOURCES.md.
+#[cfg(feature = "model-en-arctic")]
+mod weights {
+    use super::Pooling;
+    pub const MODEL_WEIGHTS: &[u8] = include_bytes!("../../weights/en-arctic/model.safetensors");
+    pub const TOKENIZER_JSON: &[u8] = include_bytes!("../../weights/en-arctic/tokenizer.json");
+    pub const CONFIG_JSON: &[u8] = include_bytes!("../../weights/en-arctic/config.json");
+    pub const MODEL_NAME: &str = "snowflake-arctic-embed-xs (en)";
+    pub const POOLING: Pooling = Pooling::Cls;
+    pub const QUERY_PREFIX: Option<&str> =
+        Some("Represent this sentence for searching relevant passages: ");
 }
 
 use weights::{CONFIG_JSON, MODEL_WEIGHTS, TOKENIZER_JSON};
 
 /// Name of the model compiled into this build, as reported by `embed_info()`.
 pub const MODEL_NAME: &str = weights::MODEL_NAME;
+
+/// Pooling strategy this model was trained with.
+pub const POOLING: Pooling = weights::POOLING;
+
+/// Prefix this model expects on the query side of a retrieval pair, if it is
+/// asymmetric. `None` means queries and documents are encoded identically.
+pub const QUERY_PREFIX: Option<&str> = weights::QUERY_PREFIX;
 
 pub const EMBEDDING_DIM: usize = 384;
 pub const MAX_SEQUENCE_LENGTH: usize = 512;
@@ -123,7 +167,10 @@ impl EmbedderModel {
             )
             .map_err(|e| anyhow!("Forward pass error: {}", e))?;
 
-        let pooled = self.mean_pooling(&embeddings, &attention_mask_tensor)?;
+        let pooled = match POOLING {
+            Pooling::Mean => self.mean_pooling(&embeddings, &attention_mask_tensor)?,
+            Pooling::Cls => self.cls_pooling(&embeddings)?,
+        };
         let normalized = self.l2_normalize(&pooled)?;
 
         normalized
@@ -131,6 +178,28 @@ impl EmbedderModel {
             .map_err(|e| anyhow!("Squeeze error: {}", e))?
             .to_vec1::<f32>()
             .map_err(|e| anyhow!("Vec conversion error: {}", e))
+    }
+
+    /// Encode text as a search query.
+    ///
+    /// Asymmetric models are trained with an instruction on the query side only;
+    /// applying it to documents degrades retrieval. On symmetric models this is
+    /// exactly `encode`, so callers can use it unconditionally and stay correct
+    /// across a model swap.
+    pub fn encode_query(&self, text: &str) -> Result<Vec<f32>> {
+        match QUERY_PREFIX {
+            Some(prefix) => self.encode(&format!("{prefix}{text}")),
+            None => self.encode(text),
+        }
+    }
+
+    /// Take the [CLS] token's hidden state as the sequence embedding.
+    fn cls_pooling(&self, embeddings: &Tensor) -> Result<Tensor> {
+        embeddings
+            .narrow(1, 0, 1)
+            .map_err(|e| anyhow!("CLS narrow error: {}", e))?
+            .squeeze(1)
+            .map_err(|e| anyhow!("CLS squeeze error: {}", e))
     }
 
     fn mean_pooling(&self, embeddings: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
