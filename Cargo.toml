@@ -23,9 +23,12 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
 
 # Embedded model selection: enable exactly one. `model-en` is the default and is
-# also what a --no-default-features build links, so only `model-es` changes it.
+# also what a --no-default-features build links, so the others need
+# --no-default-features to take effect.
 model-en = []
 model-es = []
+# Spike: retrieval-tuned English alternative to model-en, see weights/SOURCES.md.
+model-en-arctic = []
 
 [dependencies]
 pgrx = "=0.16.1"

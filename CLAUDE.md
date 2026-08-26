@@ -61,19 +61,34 @@ Two files carry everything:
 
 `engine/mod.rs` has two `mod weights` blocks, `cfg`-selected, each `include_bytes!`ing `model.safetensors`, `tokenizer.json`, and `config.json` plus a `MODEL_NAME` string:
 
-- `weights/en/` — official `mixedbread-ai/mxbai-embed-xsmall-v1`, byte-identical to upstream. Selected by `model-en` **and** by `cfg(not(feature = "model-es"))`, so it is what a `--no-default-features` build links.
+- `weights/en/` — official `mixedbread-ai/mxbai-embed-xsmall-v1`, byte-identical to upstream. Selected by `model-en` **and** by the `cfg(not(any(model-es, model-en-arctic)))` fallback, so it is what a `--no-default-features` build links.
 - `weights/es/` — Spanish variant, only under `--features model-es`.
+- `weights/en-arctic/` — `Snowflake/snowflake-arctic-embed-xs`, only under `--features model-en-arctic`. Spike for evaluation, not adopted. Its `model.safetensors` is *derived*: upstream ships F32, and it was cast to F16 by `weights/tools/convert_f32_to_f16.py` to halve its share of the binary. `config.json` and `tokenizer.json` are upstream bytes.
 
-Enabling both is a `compile_error!`. `weights/SOURCES.md` records provenance and sha256s; keep it current when weights change.
+Enabling more than one is a `compile_error!`. `weights/SOURCES.md` records provenance and sha256s — for derived files, both checksums and the command that reproduces the cast. Keep it current when weights change.
+
+Each `weights` module also carries `POOLING` and `QUERY_PREFIX`. These are training properties, not options: the wrong pooling or a missing query prefix yields embeddings of correct shape and unit norm that rank badly, and nothing raises. `model-en-arctic` is CLS-pooled and asymmetric; the other two are mean-pooled and symmetric.
 
 Consequences to expect:
 - ~48 MB is linked into the extension; combined with the release profile (`lto = "fat"`, `codegen-units = 1`) release builds are slow. Use debug/`cargo pgrx run` while iterating.
 - `EMBEDDING_DIM = 384` is a hand-maintained constant that must match `hidden_size` in the embedded `config.json`, every `vector(384)` in `sql/`, and the test assertions. `EmbedderModel::new()` now rejects a config whose `hidden_size` disagrees, so a bad swap fails at init instead of silently producing wrong-width vectors.
-- Embeddings from the two models are **not** interchangeable despite sharing dimension and tokenizer. Switching the feature invalidates stored embeddings; `SELECT embed_model();` reports what a running build contains.
+- Embeddings from the three models are **not** interchangeable despite sharing dimension and vocabulary. Switching the feature invalidates stored embeddings; `SELECT embed_model();` reports what a running build contains, and `embed_info()` adds pooling and symmetry.
+- `sql/model_eval.sql` is the way to compare two builds: same fixed retrieval set, reports top-1 / MRR / mean rank. Reconnect between builds — the model is per-backend, so an open session keeps serving the old weights.
 
 ### Model lifetime is per-backend, not per-database
 
 `MODEL: OnceCell<Mutex<EmbedderModel>>` is process-local state in a PostgreSQL backend. Every new connection loads its own instance; `embed_ready()` can be false on one connection right after another initialized. `embed_encode`/`embed_encode_batch` auto-initialize on first use, so `embed_init()` is a warm-up/diagnostic, not a prerequisite. The `Mutex` serializes inference within a backend, and `EmbedderModel::new()` forces `OMP_NUM_THREADS=1` / `RAYON_NUM_THREADS=1` so backends don't oversubscribe the host. Functions are still declared `immutable, parallel_safe` — a parallel worker is a separate backend and pays its own model-load cost.
+
+### Query and document sides are not the same call
+
+`embed_encode()` is the document side; `embed_query()` is the search side and applies the
+model's query prefix when it has one. On symmetric models the two are identical, which is
+deliberate: search SQL written against `embed_query()` survives a model swap. New search
+paths should call `embed_query()` even while the default model is symmetric, or they will
+silently lose quality the day an asymmetric model is adopted.
+
+Both go through `encode_one(text, as_query)`, and the process-local model is reached via
+`model()` — use it rather than re-deriving the `OnceCell` init dance in a new function.
 
 ### Error convention: never raise, always degrade
 

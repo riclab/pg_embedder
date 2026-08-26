@@ -102,29 +102,72 @@ cargo pgrx install --release --no-default-features --features pg16
 The embedded model is chosen with a Cargo feature. English is the default, and is also
 what a `--no-default-features` build links, so only Spanish requires an explicit flag.
 
-| Model | Cargo feature | Weights | Notes |
-| --- | --- | --- | --- |
-| `mixedbread-ai/mxbai-embed-xsmall-v1` | `model-en` (default) | `weights/en/` | Official upstream release, unmodified |
-| Spanish variant | `model-es` | `weights/es/` | Same architecture, BF16 re-save |
+| Model | Cargo feature | Weights | Payload | Notes |
+| --- | --- | --- | --- | --- |
+| `mixedbread-ai/mxbai-embed-xsmall-v1` | `model-en` (default) | `weights/en/` | 48.9 MB | Official upstream release, unmodified |
+| Spanish variant | `model-es` | `weights/es/` | 48.9 MB | Same architecture, BF16 re-save |
+| `Snowflake/snowflake-arctic-embed-xs` | `model-en-arctic` | `weights/en-arctic/` | 45.1 MB | Retrieval-tuned English, **asymmetric**, F16 cast of upstream |
 
-Build with the Spanish model instead:
+Build with a non-default model:
 
 ```bash
-cargo build --release --no-default-features --features pg17,model-es
 cargo pgrx install --release --no-default-features --features pg17,model-es
+cargo pgrx install --release --no-default-features --features pg17,model-en-arctic
 ```
 
-Enabling both `model-en` and `model-es` is a compile error. Ask a running database which
+`--no-default-features` is required: without it `model-en` stays on and enabling a second
+model is a compile error. Ask a running database which
 model it has:
 
 ```sql
 SELECT embed_model();
 ```
 
-Both models are 384-dimensional and share the same tokenizer, but their embeddings are
-**not interchangeable**: switching models invalidates every embedding already stored in
-your tables, so re-embed after a switch. See `weights/SOURCES.md` for provenance,
-checksums, and how to add another model.
+All three are 384-dimensional over the same vocabulary, but their embeddings are **not
+interchangeable**: switching models invalidates every embedding already stored in your
+tables, so re-embed after a switch. See `weights/SOURCES.md` for provenance, checksums,
+and how to add another model.
+
+### Symmetric and asymmetric models
+
+Some models are trained to encode a search query differently from a document. `model-en`
+and `model-es` are symmetric — both sides are encoded identically. `model-en-arctic` is
+asymmetric: queries carry an instruction prefix that documents must not have, and
+applying it to documents costs retrieval quality.
+
+`embed_query()` handles this. It applies whatever the loaded model needs and is exactly
+`embed_encode()` on symmetric models, so **search SQL written against `embed_query()`
+stays correct across a model swap**:
+
+```sql
+-- index side
+UPDATE docs SET embedding = embed_encode(content);
+
+-- search side, correct for every model
+SELECT id, content, cosine_similarity(embedding, embed_query('how does vector search work')) AS score
+FROM docs
+ORDER BY score DESC
+LIMIT 5;
+```
+
+`SELECT embed_is_asymmetric();` reports which kind you have, and `embed_info()` shows the
+pooling strategy alongside it.
+
+### Comparing models on your own data
+
+`sql/model_eval.sql` runs a small retrieval benchmark against whichever model the loaded
+build embeds, reporting top-1 accuracy, MRR and mean rank. Run it once per build and diff:
+
+```bash
+cargo pgrx install --release
+psql -d your_database -f sql/model_eval.sql > /tmp/eval-en.txt
+cargo pgrx install --release --no-default-features --features pg17,model-en-arctic
+psql -d your_database -f sql/model_eval.sql > /tmp/eval-arctic.txt
+diff /tmp/eval-en.txt /tmp/eval-arctic.txt
+```
+
+Reconnect between runs: the model is loaded once per backend process, so an open session
+keeps serving the previous build's weights.
 
 ## Database Setup
 
@@ -196,6 +239,7 @@ SELECT cosine_similarity(
 | `embed_ready()` | `boolean` | Returns whether the model has been loaded in the current backend/session. |
 | `embed_info()` | `text` | Returns model name, dimension, load status, and mode information. |
 | `embed_model()` | `text` | Returns the name of the embedding model compiled into this build. |
+| `embed_is_asymmetric()` | `boolean` | Whether this build's model encodes queries differently from documents. |
 | `embed_dim()` | `integer` | Returns the embedding dimension, currently `384`. |
 | `embed_version()` | `text` | Returns the extension version string. |
 
@@ -203,8 +247,10 @@ SELECT cosine_similarity(
 
 | Function | Returns | Description |
 | --- | --- | --- |
-| `embed_encode(text)` | `float4[]` | Encodes one input string into a normalized 384-dimensional embedding. |
+| `embed_encode(text)` | `float4[]` | Encodes one input string into a normalized 384-dimensional embedding. This is the document side of a retrieval pair. |
+| `embed_query(text)` | `float4[]` | Encodes a search query, applying the model's query prefix if it has one. Identical to `embed_encode()` on symmetric models. |
 | `embed_text(text)` | `text` | Encodes text and returns a pgvector-compatible vector literal string. |
+| `embed_query_text(text)` | `text` | Same as `embed_query()`, returned as a pgvector literal. |
 | `embed_encode_batch(text[])` | `float4[][]` | Encodes multiple strings and returns one embedding array per input. |
 
 ### Similarity And Distance
