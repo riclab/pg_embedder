@@ -13,7 +13,7 @@ name = "pgrx_embed_pg_embedder"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg17"]
+default = ["pg17", "model-en"]
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
@@ -21,6 +21,11 @@ pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
+
+# Embedded model selection: enable exactly one. `model-en` is the default and is
+# also what a --no-default-features build links, so only `model-es` changes it.
+model-en = []
+model-es = []
 
 [dependencies]
 pgrx = "=0.16.1"

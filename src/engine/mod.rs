@@ -4,10 +4,35 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
 use tokenizers::Tokenizer;
 
-// Embedded weights in binary
-const MODEL_WEIGHTS: &[u8] = include_bytes!("../../weights/es/model.safetensors");
-const TOKENIZER_JSON: &[u8] = include_bytes!("../../weights/es/tokenizer.json");
-const CONFIG_JSON: &[u8] = include_bytes!("../../weights/es/config.json");
+#[cfg(all(feature = "model-en", feature = "model-es"))]
+compile_error!(
+    "enable exactly one embedding model: `model-en` (default) or `model-es`. \
+     To select Spanish, build with --no-default-features --features pgNN,model-es"
+);
+
+// Embedded weights in binary. English (the official mixedbread-ai/mxbai-embed-xsmall-v1
+// release) is the default and the fallback when no model feature is selected, so
+// --no-default-features builds still link a model.
+#[cfg(not(feature = "model-es"))]
+mod weights {
+    pub const MODEL_WEIGHTS: &[u8] = include_bytes!("../../weights/en/model.safetensors");
+    pub const TOKENIZER_JSON: &[u8] = include_bytes!("../../weights/en/tokenizer.json");
+    pub const CONFIG_JSON: &[u8] = include_bytes!("../../weights/en/config.json");
+    pub const MODEL_NAME: &str = "mxbai-embed-xsmall-v1 (en)";
+}
+
+#[cfg(feature = "model-es")]
+mod weights {
+    pub const MODEL_WEIGHTS: &[u8] = include_bytes!("../../weights/es/model.safetensors");
+    pub const TOKENIZER_JSON: &[u8] = include_bytes!("../../weights/es/tokenizer.json");
+    pub const CONFIG_JSON: &[u8] = include_bytes!("../../weights/es/config.json");
+    pub const MODEL_NAME: &str = "mxbai-embed-xsmall-v1-es (es)";
+}
+
+use weights::{CONFIG_JSON, MODEL_WEIGHTS, TOKENIZER_JSON};
+
+/// Name of the model compiled into this build, as reported by `embed_info()`.
+pub const MODEL_NAME: &str = weights::MODEL_NAME;
 
 pub const EMBEDDING_DIM: usize = 384;
 pub const MAX_SEQUENCE_LENGTH: usize = 512;
@@ -25,6 +50,16 @@ impl EmbedderModel {
 
         let config: BertConfig = serde_json::from_slice(CONFIG_JSON)
             .map_err(|e| anyhow!("Failed to parse config: {}", e))?;
+
+        if config.hidden_size != EMBEDDING_DIM {
+            return Err(anyhow!(
+                "{} has hidden_size {}, but EMBEDDING_DIM is {}; update EMBEDDING_DIM and every vector({}) in sql/",
+                MODEL_NAME,
+                config.hidden_size,
+                EMBEDDING_DIM,
+                EMBEDDING_DIM
+            ));
+        }
 
         let tokenizer = Tokenizer::from_bytes(TOKENIZER_JSON)
             .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
