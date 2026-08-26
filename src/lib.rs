@@ -3,7 +3,7 @@ use pgrx::prelude::*;
 use std::sync::Mutex;
 
 mod engine;
-use engine::{EmbedderModel, EMBEDDING_DIM};
+use engine::{EmbedderModel, EMBEDDING_DIM, MODEL_NAME};
 
 pgrx::pg_module_magic!();
 
@@ -119,9 +119,15 @@ fn embed_info() -> String {
         "not loaded"
     };
     format!(
-        "mxbai-embed-xsmall-v1 | {} dims | status: {} | hybrid mode with pgvector",
-        EMBEDDING_DIM, status
+        "{} | {} dims | status: {} | hybrid mode with pgvector",
+        MODEL_NAME, EMBEDDING_DIM, status
     )
+}
+
+/// Returns the name of the embedding model compiled into this build.
+#[pg_extern(immutable, parallel_safe)]
+fn embed_model() -> &'static str {
+    MODEL_NAME
 }
 
 /// Returns embedding dimension (useful for creating tables).
@@ -133,7 +139,7 @@ fn embed_dim() -> i32 {
 /// Version information.
 #[pg_extern(immutable, parallel_safe)]
 fn embed_version() -> &'static str {
-    "pg_embedder v0.2.0 (hybrid)"
+    concat!("pg_embedder v", env!("CARGO_PKG_VERSION"), " (hybrid)")
 }
 
 /// Check if model is ready.
@@ -222,6 +228,28 @@ mod tests {
     #[pg_test]
     fn test_dimension() {
         assert_eq!(crate::embed_dim(), 384);
+    }
+
+    #[pg_test]
+    fn test_model_reported_in_info() {
+        assert!(crate::embed_info().contains(crate::embed_model()));
+    }
+
+    /// The default build embeds the English model, so English near-synonyms must
+    /// rank above an unrelated English word. Guards against shipping the wrong
+    /// weights under the default feature set.
+    #[cfg(not(feature = "model-es"))]
+    #[pg_test]
+    fn test_default_model_is_english() {
+        crate::embed_init();
+        assert!(crate::embed_model().contains("(en)"));
+
+        let related = crate::text_similarity("cat", "kitten");
+        let unrelated = crate::text_similarity("cat", "bicycle");
+        assert!(
+            related > unrelated,
+            "expected cat/kitten ({related}) to outrank cat/bicycle ({unrelated})"
+        );
     }
 
     #[pg_test]
