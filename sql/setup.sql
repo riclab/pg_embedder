@@ -26,6 +26,10 @@ AS $$
            CASE WHEN embed_ready() THEN 'ready' ELSE 'not initialized' END,
            embed_info()
     UNION ALL
+    SELECT 'model'::TEXT,
+           'embedded'::TEXT,
+           embed_model()
+    UNION ALL
     SELECT 'dimension'::TEXT,
            'configured'::TEXT,
            embed_dim()::TEXT || ' dimensions'
@@ -61,7 +65,10 @@ SELECT * FROM embed_status();
 \echo '  embed_init() -> text'
 \echo '  embed_ready() -> boolean'
 \echo '  embed_info() -> text'
+\echo '  embed_model() -> text'
 \echo '  embed_dim() -> int'
 \echo ''
 \echo '=== Quick Test ==='
-SELECT text_similarity('gato', 'felino') AS similarity;
+-- Near-synonyms should score well above an unrelated pair.
+SELECT text_similarity('cat', 'kitten')  AS related,
+       text_similarity('cat', 'bicycle') AS unrelated;

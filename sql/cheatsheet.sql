@@ -44,7 +44,10 @@ SELECT dot_product(
 );
 
 -- Direct text comparison
-SELECT text_similarity('gato', 'felino');
+SELECT text_similarity('cat', 'kitten');
+
+-- Which model is compiled into this build?
+SELECT embed_model();
 
 -- ===================
 -- TABLES
