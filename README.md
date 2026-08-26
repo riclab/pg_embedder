@@ -2,7 +2,7 @@
 
 `pg_embedder` is a PostgreSQL extension for generating neural text embeddings directly inside PostgreSQL. It is written in Rust with [`pgrx`](https://github.com/pgcentralfoundation/pgrx), runs inference with the Candle ML stack, and can be used either standalone with `FLOAT4[]` columns or together with [`pgvector`](https://github.com/pgvector/pgvector) for indexed vector search.
 
-The extension embeds the model files into the compiled shared library, so the database server does not need to load model assets from the filesystem at runtime.
+The extension embeds the model files into the compiled shared library, so the database server does not need to load model assets from the filesystem at runtime. The default build embeds the official English model [`mixedbread-ai/mxbai-embed-xsmall-v1`](https://huggingface.co/mixedbread-ai/mxbai-embed-xsmall-v1); a Spanish variant is available behind a Cargo feature.
 
 ## Features
 
@@ -12,13 +12,14 @@ The extension embeds the model files into the compiled shared library, so the da
 - Compare two texts directly with `text_similarity(text, text)`.
 - Optionally cast embeddings to `vector(384)` and use pgvector indexes/operators.
 - Run CPU-only inference with model weights embedded into the extension binary.
+- Choose the embedded model at build time: English (default) or Spanish.
 - Support PostgreSQL 13 through 18 via `pgrx` feature flags.
 
 ## Project Status
 
 This repository currently builds `pg_embedder` version `0.2.0`.
 
-The extension exposes a compact SQL API and includes example scripts under `sql/`. The current implementation is CPU-only and uses a single embedded model configured for 384-dimensional normalized embeddings.
+The extension exposes a compact SQL API and includes example scripts under `sql/`. The current implementation is CPU-only and embeds a single 384-dimensional model chosen at build time.
 
 ## Repository Layout
 
@@ -36,7 +37,10 @@ The extension exposes a compact SQL API and includes example scripts under `sql/
 |   |-- cheatsheet.sql      # Quick SQL snippets
 |   `-- rag_example.sql     # pgvector-oriented RAG example
 |-- tests/pg_regress/       # pgrx regression setup
-`-- weights/                # Embedded tokenizer/config/model assets
+`-- weights/
+    |-- SOURCES.md          # Model provenance and checksums
+    |-- en/                 # Official English model (default)
+    `-- es/                 # Spanish variant (model-es feature)
 ```
 
 ## Requirements
@@ -93,6 +97,35 @@ If you target a non-default PostgreSQL version, pass the matching feature:
 cargo pgrx install --release --no-default-features --features pg16
 ```
 
+## Model Selection
+
+The embedded model is chosen with a Cargo feature. English is the default, and is also
+what a `--no-default-features` build links, so only Spanish requires an explicit flag.
+
+| Model | Cargo feature | Weights | Notes |
+| --- | --- | --- | --- |
+| `mixedbread-ai/mxbai-embed-xsmall-v1` | `model-en` (default) | `weights/en/` | Official upstream release, unmodified |
+| Spanish variant | `model-es` | `weights/es/` | Same architecture, BF16 re-save |
+
+Build with the Spanish model instead:
+
+```bash
+cargo build --release --no-default-features --features pg17,model-es
+cargo pgrx install --release --no-default-features --features pg17,model-es
+```
+
+Enabling both `model-en` and `model-es` is a compile error. Ask a running database which
+model it has:
+
+```sql
+SELECT embed_model();
+```
+
+Both models are 384-dimensional and share the same tokenizer, but their embeddings are
+**not interchangeable**: switching models invalidates every embedding already stored in
+your tables, so re-embed after a switch. See `weights/SOURCES.md` for provenance,
+checksums, and how to add another model.
+
 ## Database Setup
 
 After installing or starting a `pgrx` development database, enable the extension:
@@ -112,6 +145,7 @@ Check status and metadata:
 ```sql
 SELECT embed_ready();
 SELECT embed_info();
+SELECT embed_model();
 SELECT embed_dim();
 SELECT embed_version();
 ```
@@ -161,6 +195,7 @@ SELECT cosine_similarity(
 | `embed_init()` | `text` | Loads the embedded model for the current backend/session if it is not already loaded. |
 | `embed_ready()` | `boolean` | Returns whether the model has been loaded in the current backend/session. |
 | `embed_info()` | `text` | Returns model name, dimension, load status, and mode information. |
+| `embed_model()` | `text` | Returns the name of the embedding model compiled into this build. |
 | `embed_dim()` | `integer` | Returns the embedding dimension, currently `384`. |
 | `embed_version()` | `text` | Returns the extension version string. |
 
@@ -336,6 +371,7 @@ The RAG example creates a `documents` table, stores chunk embeddings, creates an
 
 ## Model Behavior
 
+- The default build embeds `mixedbread-ai/mxbai-embed-xsmall-v1` (English). `SELECT embed_model();` reports what a given build contains.
 - Embeddings are 384-dimensional.
 - Outputs are L2-normalized by the engine.
 - Inputs are tokenized and truncated to a maximum sequence length of 512 tokens.
@@ -347,7 +383,7 @@ The RAG example creates a `documents` table, stores chunk embeddings, creates an
 
 - Inference is CPU-only in the current implementation.
 - The engine sets `OMP_NUM_THREADS=1` and `RAYON_NUM_THREADS=1` when the model is initialized to avoid oversubscribing PostgreSQL backend processes.
-- The model weights are embedded with `include_bytes!`, increasing the compiled extension size but simplifying runtime deployment.
+- The model weights are embedded with `include_bytes!`, adding roughly 48 MB to the compiled extension but removing any runtime model-loading dependency. Combined with the release profile (`lto = "fat"`, `codegen-units = 1`), release builds are slow; use `cargo pgrx run` while iterating.
 - For large tables, use pgvector with an HNSW or IVFFlat index instead of scanning `FLOAT4[]` arrays with SQL distance functions.
 - For bulk ingestion, consider inserting source rows first and backfilling embeddings in batches rather than embedding everything in a trigger on a latency-sensitive write path.
 
@@ -437,6 +473,18 @@ Model state is per PostgreSQL backend process, so another connection may not sha
 
 This can happen when input text is empty, model initialization failed, or inference failed. Check PostgreSQL logs for warnings emitted by the extension.
 
+### Search quality is poor or results look random
+
+Check which model the running build embeds:
+
+```sql
+SELECT embed_model();
+```
+
+An English corpus queried against the `model-es` build (or the reverse) produces weak
+rankings. Also confirm the stored embeddings were generated by the *same* model as the
+query: embeddings from different models are not comparable, so re-embed after switching.
+
 ### Dimension mismatch with pgvector
 
 Use `vector(384)` everywhere. The extension currently returns 384-dimensional embeddings:
@@ -467,7 +515,7 @@ The default build targets PostgreSQL 17:
 
 ```toml
 [features]
-default = ["pg17"]
+default = ["pg17", "model-en"]
 ```
 
 Available feature flags:
@@ -481,10 +529,11 @@ Available feature flags:
 | 17 | `pg17` |
 | 18 | `pg18` |
 
-Build with exactly one PostgreSQL feature at a time:
+Build with exactly one PostgreSQL feature at a time, optionally adding a model feature:
 
 ```bash
 cargo build --release --no-default-features --features pg17
+cargo build --release --no-default-features --features pg17,model-es
 ```
 
 ## License
