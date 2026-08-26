@@ -3,7 +3,7 @@ use pgrx::prelude::*;
 use std::sync::Mutex;
 
 mod engine;
-use engine::{EmbedderModel, EMBEDDING_DIM, MODEL_NAME};
+use engine::{EmbedderModel, Pooling, EMBEDDING_DIM, MODEL_NAME};
 
 pgrx::pg_module_magic!();
 
@@ -27,26 +27,36 @@ fn embed_init() -> &'static str {
     }
 }
 
-/// Generate embedding as float array (compatible with pgvector cast).
-#[pg_extern(immutable, parallel_safe)]
-fn embed_encode(text: &str) -> Vec<f32> {
+/// Hand out the process-local model, initializing it on first use.
+///
+/// Returns `None` when the model cannot be loaded, so callers degrade to a
+/// sentinel instead of raising and aborting the surrounding transaction.
+fn model() -> Option<&'static Mutex<EmbedderModel>> {
+    if let Some(cell) = MODEL.get() {
+        return Some(cell);
+    }
+
+    match EmbedderModel::new() {
+        Ok(loaded) => {
+            let _ = MODEL.set(Mutex::new(loaded));
+            MODEL.get()
+        }
+        Err(e) => {
+            pgrx::warning!("Model not initialized ({}). Call embed_init() first.", e);
+            None
+        }
+    }
+}
+
+fn encode_one(text: &str, as_query: bool) -> Vec<f32> {
     if text.is_empty() {
         pgrx::warning!("embed_encode: empty text provided");
         return vec![0.0; EMBEDDING_DIM];
     }
 
-    let model_cell = match MODEL.get() {
-        Some(m) => m,
-        None => {
-            // Auto-initialize if not already done
-            if let Ok(model) = EmbedderModel::new() {
-                let _ = MODEL.set(Mutex::new(model));
-                MODEL.get().unwrap()
-            } else {
-                pgrx::warning!("Model not initialized. Call embed_init() first.");
-                return vec![0.0; EMBEDDING_DIM];
-            }
-        }
+    let model_cell = match model() {
+        Some(cell) => cell,
+        None => return vec![0.0; EMBEDDING_DIM],
     };
 
     let model = match model_cell.lock() {
@@ -54,20 +64,51 @@ fn embed_encode(text: &str) -> Vec<f32> {
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    match model.encode(text) {
-        Ok(embedding) => embedding,
-        Err(e) => {
-            pgrx::warning!("Encoding failed: {}", e);
-            vec![0.0; EMBEDDING_DIM]
-        }
-    }
+    let encoded = if as_query {
+        model.encode_query(text)
+    } else {
+        model.encode(text)
+    };
+
+    encoded.unwrap_or_else(|e| {
+        pgrx::warning!("Encoding failed: {}", e);
+        vec![0.0; EMBEDDING_DIM]
+    })
 }
 
-/// Generate embedding and return as text (for easy casting to vector).
-/// Usage: SELECT embed_text('hello')::vector(384)
+/// Generate embedding as float array (compatible with pgvector cast).
+///
+/// This is the document/indexing side of a retrieval pair. Use `embed_query()`
+/// for search queries.
 #[pg_extern(immutable, parallel_safe)]
-fn embed_text(text: &str) -> String {
-    let embedding = embed_encode(text);
+fn embed_encode(text: &str) -> Vec<f32> {
+    encode_one(text, false)
+}
+
+/// Generate embedding for a search query.
+///
+/// Asymmetric models prepend an instruction to queries that documents must not
+/// carry. On symmetric models this is identical to `embed_encode()`, so search
+/// SQL written against `embed_query()` stays correct across a model swap.
+#[pg_extern(immutable, parallel_safe)]
+fn embed_query(text: &str) -> Vec<f32> {
+    encode_one(text, true)
+}
+
+/// Query embedding as a pgvector-compatible literal.
+#[pg_extern(immutable, parallel_safe)]
+fn embed_query_text(text: &str) -> String {
+    vector_literal(&embed_query(text))
+}
+
+/// Whether this build's model distinguishes queries from documents.
+#[pg_extern(immutable, parallel_safe)]
+fn embed_is_asymmetric() -> bool {
+    engine::QUERY_PREFIX.is_some()
+}
+
+/// Format an embedding the way pgvector parses a `vector` literal.
+fn vector_literal(embedding: &[f32]) -> String {
     format!(
         "[{}]",
         embedding
@@ -78,20 +119,19 @@ fn embed_text(text: &str) -> String {
     )
 }
 
+/// Generate embedding and return as text (for easy casting to vector).
+/// Usage: SELECT embed_text('hello')::vector(384)
+#[pg_extern(immutable, parallel_safe)]
+fn embed_text(text: &str) -> String {
+    vector_literal(&embed_encode(text))
+}
+
 /// Batch encode multiple texts. Returns array of embeddings.
 #[pg_extern]
 fn embed_encode_batch(texts: Vec<String>) -> Vec<Vec<f32>> {
-    let model_cell = match MODEL.get() {
-        Some(m) => m,
-        None => {
-            if let Ok(model) = EmbedderModel::new() {
-                let _ = MODEL.set(Mutex::new(model));
-                MODEL.get().unwrap()
-            } else {
-                pgrx::warning!("Model not initialized");
-                return texts.iter().map(|_| vec![0.0; EMBEDDING_DIM]).collect();
-            }
-        }
+    let model_cell = match model() {
+        Some(cell) => cell,
+        None => return texts.iter().map(|_| vec![0.0; EMBEDDING_DIM]).collect(),
     };
 
     let model = match model_cell.lock() {
@@ -119,9 +159,25 @@ fn embed_info() -> String {
         "not loaded"
     };
     format!(
-        "{} | {} dims | status: {} | hybrid mode with pgvector",
-        MODEL_NAME, EMBEDDING_DIM, status
+        "{} | {} dims | pooling: {} | {} | status: {} | hybrid mode with pgvector",
+        MODEL_NAME,
+        EMBEDDING_DIM,
+        pooling_name(),
+        if engine::QUERY_PREFIX.is_some() {
+            "asymmetric (use embed_query for searches)"
+        } else {
+            "symmetric"
+        },
+        status
     )
+}
+
+/// Pooling strategy of the compiled-in model, for `embed_info()`.
+fn pooling_name() -> &'static str {
+    match engine::POOLING {
+        Pooling::Mean => "mean",
+        Pooling::Cls => "cls",
+    }
 }
 
 /// Returns the name of the embedding model compiled into this build.
@@ -233,6 +289,51 @@ mod tests {
     #[pg_test]
     fn test_model_reported_in_info() {
         assert!(crate::embed_info().contains(crate::embed_model()));
+    }
+
+    /// Search SQL is written against embed_query() regardless of model. On a
+    /// symmetric build it must stay byte-identical to embed_encode(), or callers
+    /// would get different vectors for the same text depending on entry point.
+    #[cfg(not(feature = "model-en-arctic"))]
+    #[pg_test]
+    fn test_query_equals_encode_when_symmetric() {
+        crate::embed_init();
+        assert!(!crate::embed_is_asymmetric());
+        assert_eq!(
+            crate::embed_encode("vector search"),
+            crate::embed_query("vector search")
+        );
+    }
+
+    #[cfg(feature = "model-en-arctic")]
+    #[pg_test]
+    fn test_query_prefix_applied_when_asymmetric() {
+        crate::embed_init();
+        assert!(crate::embed_is_asymmetric());
+        assert!(crate::embed_model().contains("arctic"));
+
+        // The prefix has to actually reach the encoder, otherwise the model is
+        // being used symmetrically and silently losing retrieval quality.
+        assert_ne!(
+            crate::embed_encode("vector search"),
+            crate::embed_query("vector search")
+        );
+    }
+
+    /// End-to-end retrieval sanity, using each side of the pair as intended.
+    /// Holds for symmetric and asymmetric builds alike.
+    #[cfg(not(feature = "model-es"))]
+    #[pg_test]
+    fn test_query_retrieves_relevant_document() {
+        crate::embed_init();
+
+        let query = crate::embed_query("how do I store embeddings in postgres");
+        let relevant = crate::embed_encode("PostgreSQL can store vector embeddings in a table column.");
+        let irrelevant = crate::embed_encode("Sourdough needs a starter and a long cold ferment.");
+
+        let hit = crate::cosine_similarity(query.clone(), relevant);
+        let miss = crate::cosine_similarity(query, irrelevant);
+        assert!(hit > miss, "relevant doc scored {hit}, irrelevant scored {miss}");
     }
 
     /// The default build embeds the English model, so English near-synonyms must
